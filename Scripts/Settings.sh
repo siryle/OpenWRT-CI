@@ -54,7 +54,5 @@ else
 	echo "CONFIG_PACKAGE_luci-app-ssr-plus=y" >> ./.config
  	echo "CONFIG_PACKAGE_luci-app-openclash=y" >> ./.config
   	echo "CONFIG_PACKAGE_luci-app-mihomo=y" >> ./.config
-   	echo "CONFIG_PACKAGE_luci-app-daed=y" >> ./.config
-    	echo "CONFIG_PACKAGE_luci-theme-alpha=y" >> ./.config
-     	echo "CONFIG_PACKAGE_luci-app-alpha-config=y" >> ./.config    	
+   	echo "CONFIG_PACKAGE_luci-app-daed=y" >> ./.config	
 fi
