@@ -44,3 +44,9 @@ FIX "mini-diskmanager" "$PACKAGE_PATH/luci-app-mini-diskmanager" sed -i "s/servi
 #修改natmapt菜单位置
 FIX "natmapt" "$PACKAGE_PATH/luci-app-natmapt" sed -i "s/network/services/g" \
 	"$PACKAGE_PATH/luci-app-natmapt/root/usr/share/luci/menu.d/luci-app-natmap.json"
+
+#修改honk默认配置：让Doona面板监听0.0.0.0:9527，允许局域网直接通过浏览器访问
+if [ -d "$PACKAGE_PATH/honk/files" ]; then
+	sed -i "s/listen: '127\.0\.0\.1:9527'/listen: '0.0.0.0:9527'/" "$PACKAGE_PATH/honk/files/system.dae" 2>/dev/null || true
+	echo "honk: Doona Web UI listen address set to 0.0.0.0:9527"
+fi

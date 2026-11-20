@@ -1,0 +1,299 @@
+diff --git a/honk/files/90-honk-boot b/honk/files/90-honk-boot
+index 3ce34cd..e95c515 100644
+--- a/honk/files/90-honk-boot
++++ b/honk/files/90-honk-boot
+@@ -3,9 +3,57 @@
+ # 不再提供单独的 boot_enabled 开关。
+ /etc/init.d/honk enable
+ 
++# Keep .lan/.local names working when the core's DNS controller intercepts port
++# 53: send those suffixes to the default (SmartDNS) upstream. Older conffiles do
++# not carry the rule; add it once. Without it a private-domain lookup falls
++# through to the proxy/DoH fallback and answers NXDOMAIN on a box with no node.
++if [ -f /etc/honk/config.dae ] && ! grep -q 'qname(suffix: lan)' /etc/honk/config.dae; then
++	sed -i 's/^\([[:space:]]*\)qname(geosite: private) -> asis/\1qname(suffix: lan) -> default\n\1qname(suffix: local) -> default\n\1qname(geosite: private) -> asis/' /etc/honk/config.dae
++fi
++
++# The native API/UI (doona on port 9527) used to bind loopback only, so the
++# controller page could not be opened from the LAN. system.dae is a conffile:
++# upgrades keep the old copy, so rewrite it once here.
++if [ -f /etc/honk/system.dae ] && grep -q "listen: '127.0.0.1:9527'" /etc/honk/system.dae; then
++	sed -i "s/listen: '127\.0\.0\.1:9527'/listen: '0.0.0.0:9527'/" /etc/honk/system.dae
++fi
++
++# All DNS must go to the local SmartDNS. Stock and older conffiles send
++# non-CN queries to 8.8.8.8 through the proxy, which bypasses SmartDNS's
++# split entirely. Collapse the dns block to one upstream (127.0.0.1:53,
++# direct) with fallback default. SmartDNS's own foreign DoH is not in
++# geoip:cn, so the routing fallback (proxy) already covers it.
++if [ -f /etc/honk/config.dae ] && grep -qE '^[[:space:]]*(remote:|fallback:[[:space:]]*remote)' /etc/honk/config.dae; then
++	sed -i \
++		-e '/^[[:space:]]*remote:.*->.*proxy[[:space:]]*$/d' \
++		-e 's/^\([[:space:]]*\)fallback: remote/\1fallback: default/' \
++		-e "s|^\([[:space:]]*\)default: .*-> direct[[:space:]]*$|\1default: 'udp://127.0.0.1:53' -> direct|" \
++		/etc/honk/config.dae
++fi
++
++# The stock group has no filter, so it resolves 0 nodes even when the
++# subscription carries some. Include every node.
++if [ -f /etc/honk/config.dae ] && ! grep -q 'filter: name' /etc/honk/config.dae; then
++	sed -i "s|^\([[:space:]]*\)policy: min_moving_avg|\1policy: min_moving_avg\n\1filter: name(keyword: '')|" /etc/honk/config.dae
++fi
++
++# Force NFQUEUE off, unconditionally.
++#
++# This image does not ship nft_queue / nfnetlink_queue (the TCX datapath does
++# not use them), but /etc/honk/system.dae is a conffile: a keep-settings
++# upgrade keeps the old `nfqueue_enable: true`, and the packaged
++# control.sh/maintenance.sh rewrite the flag back to true. Either one makes
++# honk's preflight refuse to start ("缺少内核模块 nft_queue"). Sed all three
++# here; the packaged files are also patched at build time, this is the
++# upgrade-time safety net.
++for f in /etc/honk/system.dae /usr/share/honk/control.sh /usr/share/honk/maintenance.sh; do
++	[ -f "$f" ] && sed -i 's/nfqueue_enable: true/nfqueue_enable: false/g' "$f"
++done
++
+ # 配置模式已取消：只清遗留键，活动配置与启停状态一概不动。
+ legacy_mode=$(uci -q get honk.main.config_mode 2>/dev/null)
+ if [ -n "$legacy_mode" ]; then
+ 	uci -q delete honk.main.config_mode && uci -q commit honk
+ fi
++
+ exit 0
+diff --git a/honk/files/config.dae b/honk/files/config.dae
+index c71c704..350e8d7 100644
+--- a/honk/files/config.dae
++++ b/honk/files/config.dae
+@@ -45,33 +45,33 @@ experimental {
+ group {
+     proxy {
+         policy: min_moving_avg
++        # Include every node the subscription provides. Without a filter the
++        # group resolves 0 nodes and the proxy has no outbound at all.
++        filter: name(keyword: '')
+     }
+ }
+ 
+ dns {
+-    # 直连查询带上客户端网段，国内 CDN 才会返回就近地址
+-    client_subnet: auto
++    # Every DNS query belongs to the local SmartDNS. It does the CN/foreign
++    # split itself; its foreign DoH/bootstrap is caught by the geoip rules
++    # below because those resolver IPs are not in geoip:cn. Do not add a
++    # remote upstream here: that would bypass SmartDNS.
+     upstream {
+-        default: 'https://223.5.5.5/dns-query?tls_server_name=dns.alidns.com' -> direct
+-        remote: 'https://8.8.8.8/dns-query?tls_server_name=dns.google' -> proxy
++        default: 'udp://127.0.0.1:53' -> direct
+     }
+     routing {
+         request {
++            qname(suffix: lan) -> default
++            qname(suffix: local) -> default
+             qname(geosite: private) -> asis
+-            qname(geosite: cn) -> default
+-            fallback: remote
+-        }
+-        # 远端返回国内 IP 时也采信，避免两边解析结果不一致
+-        response {
+-            upstream(remote) -> accept
+-            qname(geosite: private) -> accept
+-            ip(geoip: cn) -> accept
+-            fallback: remote
++            fallback: default
+         }
+     }
+ }
+ 
+ routing {
++    # DNS itself is never proxied: SmartDNS is the only resolver.
++    dport(53) -> direct(must)
+     dip(224.0.0.0/3, 'ff00::/8') -> direct
+     # 其它代理核心和 DNS 守护进程的出站不能再被抓一次，否则成环。
+     pname(AdGuardHome, mosdns, mihomo, sing-box, clash, frpc, xray, v2ray) -> direct(must)
+diff --git a/honk/files/control.sh b/honk/files/control.sh
+index 3e3feb2..52d6914 100755
+--- a/honk/files/control.sh
++++ b/honk/files/control.sh
+@@ -1326,6 +1326,30 @@ panel_managed_system() {
+ 	return 1
+ }
+ 
++# 启动时自动收尾被中断的维护事务。只在没有任何在途操作时动手：
++#   * HONK_MAINT_CAP 由 maintenance.sh 在恢复/回滚过程中导出，不能抢；
++#   * 签名更新（/etc/.honk-update）需要重装完整包集，不能自动回滚；
++#   * 活锁 / 非托管 honk-core 说明还有人在用，保持原状让 UI 报错。
++# 回滚本身不启动服务（HONK_RECOVER_NO_START=1），由调用方继续正常的启动流程，
++# 避免 start_service -> recover -> start_service 的递归。
++auto_recover() {
++	[ -n "${HONK_MAINT_CAP:-}" ] && return 0
++	if [ -e /etc/.honk-update/journal ] || [ -L /etc/.honk-update/journal ]; then
++		return 0
++	fi
++	if [ ! -d "$HONK_LOCK_DIR" ] && [ ! -e "$HONK_MAINT_JOURNAL" ] && [ ! -L "$HONK_MAINT_JOURNAL" ]; then
++		return 0
++	fi
++	if [ -d "$HONK_LOCK_DIR" ]; then
++		[ -r "$HONK_LOCK_DIR/pid" ] || return 1
++		honk_lock_is_stale || return 1
++	fi
++	pidof honk-core >/dev/null 2>&1 && return 1
++	logger -t honk "recovering interrupted maintenance transaction" 2>/dev/null || :
++	rm -rf "$HONK_LOCK_DIR" 2>/dev/null || :
++	HONK_RECOVER_NO_START=1 /usr/share/honk/maintenance.sh recover >/dev/null 2>&1
++}
++
+ case "$1" in
+ 	check)
+ 		preflight
+@@ -1367,8 +1391,11 @@ case "$1" in
+ 	recover)
+ 		recover
+ 		;;
++	auto-recover)
++		auto_recover
++		;;
+ 	*)
+-		echo "usage: $0 {check|diagnose|preflight|local-direct|local-direct-file|initialize|settings|repair|detach|recover|write-system|panel-managed}" >&2
++		echo "usage: $0 {check|diagnose|preflight|local-direct|local-direct-file|initialize|settings|repair|detach|recover|auto-recover|write-system|panel-managed}" >&2
+ 		exit 2
+ 		;;
+ esac
+diff --git a/honk/files/direct-unspec b/honk/files/direct-unspec
+new file mode 100644
+index 0000000..0344779
+--- /dev/null
++++ b/honk/files/direct-unspec
+@@ -0,0 +1,10 @@
++honk-core built with the mydist direct hand-back patch (p1).
++
++Direct-classified flows return TC_ACT_UNSPEC and carry DIRECT_UNSPEC_MARK, so the
++classic TC chain (mydist's dpd) sees them and can keep accelerating direct
++traffic while honk proxies the rest. Proxy and block verdicts remain terminal for
++honk, and NAT stays with einat on the WAN.
++
++Absence of this file means an unpatched core: dpd must stay in observe while honk
++owns the LAN TCX, because its direct exits return TC_ACT_OK and the classic chain
++is never reached.
+diff --git a/honk/files/honk.init b/honk/files/honk.init
+index 1db7625..251588d 100755
+--- a/honk/files/honk.init
++++ b/honk/files/honk.init
+@@ -17,6 +17,14 @@ boot() {
+ 
+ start_service() {
+ 	local enabled initialized config_file ready_token ready_hash ready_runtime ready_api_enabled ready_api_listen ready_clash_api_listen ready_clash_api_secret_set old_ready_token
++	# 掉电或 UI 任务被杀会留下 /etc/.honk-maintenance/journal。必须在
++	# enabled/initialized 判断之前收尾：中断的 restore/reset 可能把 enabled 写回 0，
++	# 那样服务永远起不来，状态页也就一直卡在“需要恢复系统”。
++	if ! "$HONK_CONTROL" auto-recover >/dev/null 2>&1; then
++		if [ -e /etc/.honk-maintenance/journal ] || [ -L /etc/.honk-maintenance/journal ]; then
++			logger -t honk "interrupted maintenance transaction still needs manual recovery"
++		fi
++	fi
+ 	config_load honk
+ 	config_get_bool enabled main enabled 0
+ 	config_get_bool initialized main initialized 0
+diff --git a/honk/files/maintenance.sh b/honk/files/maintenance.sh
+index 0b6adee..2ae4dae 100755
+--- a/honk/files/maintenance.sh
++++ b/honk/files/maintenance.sh
+@@ -107,8 +107,14 @@ issue_capability() {
+ 	chmod 0600 "$cap_tmp" || { rm -f "$cap_tmp"; return 1; }
+ 	mv -f "$cap_tmp" "$CAPABILITY" || { rm -f "$cap_tmp"; return 1; }
+ 	export HONK_MAINT_CAP=$cap_nonce
+-	honk_lifecycle_start 30
+-	cap_start_rc=$?
++	if [ "${HONK_RECOVER_NO_START:-0}" = 1 ]; then
++		# Boot-time auto-recovery: the caller (init start_service) continues the
++		# normal start, so do not start a nested procd instance here.
++		cap_start_rc=0
++	else
++		honk_lifecycle_start 30
++		cap_start_rc=$?
++	fi
+ 	unset HONK_MAINT_CAP
+ 	return "$cap_start_rc"
+ }
+@@ -126,7 +132,7 @@ stop_managed() {
+ restore_running() {
+ 	if [ "$old_running" != 1 ]; then service_stopped=0; return 0; fi
+ 	foreign_core_running && return 1
+-	honk_lifecycle_start 30 || return 1
++	recover_start || return 1
+ 	service_stopped=0
+ }
+ 
+@@ -191,6 +197,13 @@ journal_value() {
+ 	sed -n "s/^$1=//p" "$JOURNAL" 2>/dev/null
+ }
+ 
++# During boot-time auto-recovery the caller continues the normal start, so the
++# rollback must not start a nested procd instance (HONK_RECOVER_NO_START=1).
++recover_start() {
++	[ "${HONK_RECOVER_NO_START:-0}" = 1 ] && return 0
++	honk_lifecycle_start 30
++}
++
+ recover_transaction() {
+ 	[ -e "$TXN_DIR" ] || { journal_active=0; return 0; }
+ 	[ -d "$TXN_DIR" ] && [ ! -L "$TXN_DIR" ] && [ -f "$JOURNAL" ] && [ ! -L "$JOURNAL" ] || return 1
+@@ -221,7 +234,7 @@ recover_transaction() {
+ 		journal_active=0
+ 		swap_started=0
+ 		if [ "$journal_operation" = backup ] && [ "$old_running" = 1 ]; then
+-			honk_lifecycle_start 30 || return 1
++			recover_start || return 1
+ 		fi
+ 		service_stopped=0
+ 		return 0
+@@ -252,7 +265,7 @@ recover_transaction() {
+ 				# A backup never changes the live tree; clear its journal before normal startup.
+ 				rm -rf "$TXN_DIR" || return 1
+ 				journal_active=0
+-				honk_lifecycle_start 30 || return 1
++				recover_start || return 1
+ 			fi
+ 		fi
+ 	else
+diff --git a/honk/files/system.dae b/honk/files/system.dae
+index e85a994..66304e0 100644
+--- a/honk/files/system.dae
++++ b/honk/files/system.dae
+@@ -7,13 +7,17 @@ global {
+     auto_config_kernel_parameter: true
+     data_dir: '/etc/honk'
+     store_subscribe: true
+-    nfqueue_enable: true
++    nfqueue_enable: false
+ }
+ 
+ experimental {
+     native_api {
+         enabled: true
+-        listen: '127.0.0.1:9527'
++        # The native API is the proxy's controller UI (doona), not a datapath
++        # listener: it has to answer the browser on the LAN, so bind all
++        # addresses. password_auth stays on (first visit creates the admin),
++        # and the WAN side is still closed by the firewall.
++        listen: '0.0.0.0:9527'
+         password_auth: true
+         allow_anonymous_loopback: false
+         config_write: true
+diff --git a/luci-app-honk/root/usr/libexec/rpcd/honk b/luci-app-honk/root/usr/libexec/rpcd/honk
+index 8035e2f..5664291 100755
+--- a/luci-app-honk/root/usr/libexec/rpcd/honk
++++ b/luci-app-honk/root/usr/libexec/rpcd/honk
+@@ -1098,6 +1098,12 @@ is_managed_core() {
+ 
+ begin_mutation() {
+ 	if [ -e /etc/.honk-update/journal ] || [ -L /etc/.honk-update/journal ]; then emit_result false update_recovery_required; exit 1; fi
++	# A power loss or a killed UI job can leave a maintenance journal behind.
++	# Recover it before taking the lock, otherwise preflight refuses every start
++	# and the status page stays on "recovery required" until the button is used.
++	if [ -e /etc/.honk-maintenance/journal ] || [ -L /etc/.honk-maintenance/journal ]; then
++		"$CONTROL" auto-recover >/dev/null 2>&1 || :
++	fi
+ 	# A caller that timed out mid-operation cannot release the lock itself. Without
+ 	# this, one aborted apply wedges every later configuration operation.
+ 	if honk_lock_is_stale; then rm -rf "$HONK_LOCK_DIR"; fi
